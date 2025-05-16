@@ -3,7 +3,39 @@ require_once 'inc/functions.php';
 checkLogin();
 global $db;
 
-// 利润表配置，含行次、公式、归集
+// -------- 账套和期间（与资产负债表保持一致，SESSION全局切换） --------
+$books = getBooks();
+$currentBookId = isset($_SESSION['book_id']) ? intval($_SESSION['book_id']) : (isset($books[0]['id']) ? intval($books[0]['id']) : 0);
+if (isset($_GET['book_id']) && intval($_GET['book_id']) != $currentBookId) {
+    $_SESSION['book_id'] = intval($_GET['book_id']);
+    $currentBookId = $_SESSION['book_id'];
+}
+$currentBook = null;
+foreach ($books as $b) {
+    if ($b['id'] == $currentBookId) { $currentBook = $b; break; }
+}
+
+if (isset($_GET['period_year'])) {
+    $_SESSION['period_year'] = intval($_GET['period_year']);
+}
+if (isset($_GET['period_month'])) {
+    $_SESSION['period_month'] = intval($_GET['period_month']);
+}
+$sel_year = isset($_SESSION['period_year']) ? intval($_SESSION['period_year']) : date('Y');
+$sel_month = isset($_SESSION['period_month']) ? intval($_SESSION['period_month']) : date('n');
+$month = sprintf('%04d-%02d', $sel_year, $sel_month);
+$month1 = date('Y-m-01', strtotime($month . '-01'));
+$month2 = date('Y-m-t', strtotime($month . '-01'));
+$date1  = date('Y-01-01', strtotime($month . '-01'));
+$date2  = $month2;
+
+// 页头信息
+$report_title = "利润表";
+$report_date = $month2;
+$report_unit = "元";
+$company = $currentBook['name'] ?? '';
+
+// -------- 利润表配置 --------
 $income_rows = [
     ['idx'=>1,  'label'=>'一、营业收入',      'accounts'=>['5001','5051'], 'type'=>'credit'],
     ['idx'=>2,  'label'=>'减：营业成本',      'accounts'=>['5401','5402'], 'type'=>'debit'],
@@ -39,30 +71,53 @@ $income_rows = [
     ['idx'=>32, 'label'=>'四、净利润（净亏损以“-”号填列）','formula'=>'(30)-(31)'],
 ];
 
-// 查询损益发生额
-function get_income_item_amount($accounts, $type, $date1, $date2) {
+// 查询损益发生额，只统计非结转凭证的本期贷方/借方发生额
+function get_income_item_amount($accounts, $type, $date1, $date2, $book_id) {
     global $db;
     if (!$accounts) return 0.0;
-    $codes = implode("','", $accounts);
-    $sql = "SELECT SUM(" . ($type=='credit' ? 'credit-debit' : 'debit-credit') . ") FROM voucher_items vi JOIN vouchers v ON v.id=vi.voucher_id WHERE vi.account_code IN ('$codes') AND v.date>=? AND v.date<=?";
-    $stmt = $db->prepare($sql);
-    $stmt->execute([$date1, $date2]);
-    return floatval($stmt->fetchColumn());
-}
+    // 5603财务费用特殊处理
+    if (count($accounts) === 1 && (strval($accounts[0]) == '5603')) {
+        // 借方
+        $sql_debit = "SELECT SUM(vi.debit) FROM voucher_items vi 
+            JOIN vouchers v ON v.id=vi.voucher_id 
+            WHERE vi.account_code = ? AND v.book_id=? 
+            AND v.date>=? AND v.date<=?
+            AND (vi.summary IS NULL OR vi.summary NOT IN ('结转本月损益','结转本年利润'))";
+        $stmt_debit = $db->prepare($sql_debit);
+        $stmt_debit->execute(['5603', $book_id, $date1, $date2]);
+        $debit = $stmt_debit->fetchColumn();
+        $debit = is_null($debit) ? 0 : floatval($debit);
 
-// 期间参数（月末模式）
-if (isset($_GET['month']) && preg_match('/^\d{4}-\d{2}$/', $_GET['month'])) {
-    $month = $_GET['month'];
-} else {
-    $month = date('Y-m');
+        // 贷方
+        $sql_credit = "SELECT SUM(vi.credit) FROM voucher_items vi 
+            JOIN vouchers v ON v.id=vi.voucher_id 
+            WHERE vi.account_code = ? AND v.book_id=? 
+            AND v.date>=? AND v.date<=?
+            AND (vi.summary IS NULL OR vi.summary NOT IN ('结转本月损益','结转本年利润'))";
+        $stmt_credit = $db->prepare($sql_credit);
+        $stmt_credit->execute(['5603', $book_id, $date1, $date2]);
+        $credit = $stmt_credit->fetchColumn();
+        $credit = is_null($credit) ? 0 : floatval($credit);
+
+        return $debit - $credit;
+    }
+    // 其他科目
+    $placeholders = implode(',', array_fill(0, count($accounts), '?'));
+    $sql_where = "vi.account_code IN ($placeholders) AND v.book_id=? AND v.date>=? AND v.date<=? AND (vi.summary IS NULL OR vi.summary NOT LIKE '%结转%')";
+    if ($type == 'credit') {
+        $sql = "SELECT SUM(vi.credit) FROM voucher_items vi JOIN vouchers v ON v.id=vi.voucher_id WHERE $sql_where";
+    } else {
+        $sql = "SELECT SUM(vi.debit) FROM voucher_items vi JOIN vouchers v ON v.id=vi.voucher_id WHERE $sql_where";
+    }
+    $params = array_merge($accounts, [$book_id, $date1, $date2]);
+    $stmt = $db->prepare($sql);
+    $stmt->execute($params);
+    $amount = $stmt->fetchColumn();
+    return is_null($amount) ? 0 : floatval($amount);
 }
-$month1 = date('Y-m-01', strtotime($month . '-01'));
-$month2 = date('Y-m-t', strtotime($month . '-01'));
-$date1 = date('Y-01-01', strtotime($month . '-01'));
-$date2 = $month2;
 
 // 自动公式
-function calc_income_row($row, $col, $date1, $date2, $month1, $month2, &$cache) {
+function calc_income_row($row, $col, $date1, $date2, $month1, $month2, &$cache, $book_id) {
     if (!empty($row['formula'])) {
         preg_match_all('/\((\d+)\)/', $row['formula'], $m);
         $nums = $m[1];
@@ -84,41 +139,132 @@ function calc_income_row($row, $col, $date1, $date2, $month1, $month2, &$cache) 
             $row['accounts'],
             $row['type'] ?? 'credit',
             $col == 'year' ? $date1 : $month1,
-            $col == 'year' ? $date2 : $month2
+            $col == 'year' ? $date2 : $month2,
+            $book_id
         );
         return $res;
     }
 }
 
-// 页面
+// --------- 导出CSV ---------
+if (isset($_GET['export']) && $_GET['export'] == 'csv') {
+    header('Content-Type: text/csv; charset=UTF-8');
+    header('Content-Disposition: attachment;filename=利润表.csv');
+    $fp = fopen('php://output', 'w');
+    fwrite($fp, chr(0xEF).chr(0xBB).chr(0xBF));
+    fputcsv($fp, [$report_title]);
+    fputcsv($fp, ["核算单位：$company", '', '', $report_date, "单位：$report_unit"]);
+    fputcsv($fp, ['项目', '行次', '本年累计金额', '本月金额']);
+    $cache = [];
+    foreach($income_rows as $row) {
+        $year_val = calc_income_row($row, 'year', $date1, $date2, $month1, $month2, $cache, $currentBookId);
+        $month_val = calc_income_row($row, 'month', $date1, $date2, $month1, $month2, $cache, $currentBookId);
+        $cache[$row['idx']] = ['year'=>$year_val, 'month'=>$month_val];
+        fputcsv($fp, [
+            $row['label'],
+            $row['idx'],
+            number_format($year_val,2,'.',''),
+            number_format($month_val,2,'.','')
+        ]);
+    }
+    fclose($fp);
+    exit;
+}
+
 include 'templates/header.php';
 ?>
-<h2>利润表</h2>
-<form>
-    会计期间：<input type="month" name="month" value="<?=htmlspecialchars($month)?>">
-    <button class="btn" type="submit">查询</button>
-</form>
-<table border="1" cellspacing="0" cellpadding="4" style="width:100%;border-collapse:collapse;font-size:16px;">
-<tr>
-    <th>项目</th>
-    <th>行次</th>
-    <th>本年累计金额</th>
-    <th>本月金额</th>
-</tr>
-<?php
-$cache = [];
-foreach($income_rows as $row) {
-    $year_val = calc_income_row($row, 'year', $date1, $date2, $month1, $month2, $cache);
-    $month_val = calc_income_row($row, 'month', $date1, $date2, $month1, $month2, $cache);
-    $cache[$row['idx']] = ['year'=>$year_val, 'month'=>$month_val];
-    echo "<tr>";
-    echo "<td>{$row['label']}</td>";
-    echo "<td>{$row['idx']}</td>";
-    echo "<td style='text-align:right'>".number_format($year_val,2)."</td>";
-    echo "<td style='text-align:right'>".number_format($month_val,2)."</td>";
-    echo "</tr>";
+<style>
+.report-center-wrap {
+    max-width: 950px;
+    margin: 36px auto 0 auto;
+    background: #fff;
+    border-radius: 14px;
+    box-shadow: 0 2px 16px #e7ecf5;
+    padding: 26px 32px 36px 32px;
 }
-?>
-</table>
-<br>
+.btn-blue {
+    background: #3490ff;
+    border: none;
+    color: #fff;
+    padding: 7px 24px;
+    border-radius: 6px;
+    font-size: 15px;
+    margin-right: 12px;
+    cursor: pointer;
+    transition: background 0.2s;
+}
+.btn-blue:hover {
+    background: #2779bd;
+}
+@media print {
+    body * {
+        visibility: hidden !important;
+    }
+    #print-area, #print-area * {
+        visibility: visible !important;
+    }
+    #print-area {
+        position: absolute;
+        left: 0; top: 0; width: 210mm; min-height: 297mm;
+        margin: 0 !important;
+        background: #fff !important;
+        box-shadow: none !important;
+        padding: 0 !important;
+    }
+    @page {
+        size: A4 portrait;
+        margin: 16mm 10mm 14mm 10mm;
+    }
+    html, body {
+        width: 210mm;
+        height: 297mm;
+        background: #fff !important;
+    }
+}
+@media (max-width: 1050px) {
+    .report-center-wrap { max-width: 99vw; padding: 10px 2px; }
+}
+</style>
+<div class="report-center-wrap">
+    <div class="no-print" style="margin-bottom:14px;">
+        <form method="get" action="" style="display:inline;">
+            <input type="hidden" name="export" value="csv" />
+            <button type="submit" class="btn-blue">导出CSV</button>
+        </form>
+        <button class="btn-blue" onclick="window.print()">打印</button>
+    </div>
+    <div id="print-area">
+        <div style="width:100%;margin-bottom:8px;">
+            <div style="text-align:center;font-weight:bold;font-size:22px;"><?= htmlspecialchars($report_title) ?></div>
+            <table style="width:100%;border:none;font-size:15px;margin-top:3px;margin-bottom:8px;">
+                <tr>
+                    <td style="border:none;padding:0;" colspan="2">核算单位：<?= htmlspecialchars($company) ?></td>
+                    <td style="border:none;padding:0;text-align:right;" colspan="2"><?= htmlspecialchars($report_date) ?>&nbsp;&nbsp;单位：<?= htmlspecialchars($report_unit) ?></td>
+                </tr>
+            </table>
+        </div>
+        <table border="1" cellspacing="0" cellpadding="4" style="width:100%;border-collapse:collapse;font-size:15px;">
+            <tr style="background:#f6f6f6;">
+                <th style="width:40%;">项目</th>
+                <th style="width:8%;">行次</th>
+                <th style="width:26%;">本年累计金额</th>
+                <th style="width:26%;">本月金额</th>
+            </tr>
+            <?php
+            $cache = [];
+            foreach($income_rows as $row):
+                $year_val = calc_income_row($row, 'year', $date1, $date2, $month1, $month2, $cache, $currentBookId);
+                $month_val = calc_income_row($row, 'month', $date1, $date2, $month1, $month2, $cache, $currentBookId);
+                $cache[$row['idx']] = ['year'=>$year_val, 'month'=>$month_val];
+            ?>
+            <tr>
+                <td><?= htmlspecialchars($row['label']) ?></td>
+                <td align="center"><?= $row['idx'] ?></td>
+                <td align="right"><?= number_format($year_val,2) ?></td>
+                <td align="right"><?= number_format($month_val,2) ?></td>
+            </tr>
+            <?php endforeach; ?>
+        </table>
+    </div>
+</div>
 <?php include 'templates/footer.php'; ?>
